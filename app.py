@@ -1,125 +1,216 @@
-import cv2
-import mediapipe as mp
-import numpy as np
+"""Rock Paper Scissors played with hand gestures.
+
+Hold a gesture steady until the countdown fires, then the computer plays.
+
+Gestures
+    closed fist ............ Rock
+    two fingers ............ Scissors
+    open hand .............. Paper
+
+Keys
+    r  reset scores        ESC / q  quit
+
+Run:  py -3.11 app.py
+"""
+
+import os
 import random
+import sys
 import time
+from collections import Counter, deque
 
-# ---------------- CONFIG ----------------
-ROUND_TIME = 2.5   # seconds per round
-STABLE_FRAMES = 8  # smoothing frames
-# ----------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from cvkit import FPS, bootstrap, draw_hud, open_camera  # noqa: E402
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
-mp_draw = mp.solutions.drawing_utils
+bootstrap()
 
-cap = cv2.VideoCapture(0)
+import cv2  # noqa: E402
+import mediapipe as mp  # noqa: E402
 
-player_score = 0
-computer_score = 0
+WINDOW = "Stone Paper Scissors"
 
-gesture_buffer = []
-last_round_time = time.time()
-computer_choice = random.choice(["Rock", "Paper", "Scissors"])
-round_result = ""
+STABLE_FRAMES = 12
+ROUND_COOLDOWN = 2.0  # seconds before the next round can start
 
-def get_gesture(hand_landmarks):
-    tips = [4, 8, 12, 16, 20]
-    fingers = []
+TIPS = [4, 8, 12, 16, 20]
+BEATS = {"Rock": "Scissors", "Scissors": "Paper", "Paper": "Rock"}
 
-    # Thumb
-    fingers.append(hand_landmarks.landmark[tips[0]].x <
-                   hand_landmarks.landmark[tips[0] - 1].x)
 
-    # Other fingers
-    for i in range(1, 5):
-        fingers.append(hand_landmarks.landmark[tips[i]].y <
-                       hand_landmarks.landmark[tips[i] - 2].y)
+def count_fingers(hand_landmarks, handedness):
+    """Number of extended fingers, correct for either hand.
 
-    if fingers == [False, False, False, False, False]:
-        return "Rock"
-    elif fingers == [True, True, True, True, True]:
-        return "Paper"
-    elif fingers == [False, True, True, False, False]:
-        return "Scissors"
+    The thumb comparison flips between hands; the original always used the
+    right-hand rule so a left hand mis-counted by one and made "Rock" register
+    as "Scissors".
+    """
+    lm = hand_landmarks.landmark
+    fingers = 0
+
+    if handedness == "Left":
+        if lm[TIPS[0]].x > lm[TIPS[0] - 1].x:
+            fingers += 1
     else:
-        return None
+        if lm[TIPS[0]].x < lm[TIPS[0] - 1].x:
+            fingers += 1
 
-def decide_winner(player, computer):
-    if player == computer:
+    for i in range(1, 5):
+        if lm[TIPS[i]].y < lm[TIPS[i] - 2].y:
+            fingers += 1
+
+    return fingers
+
+
+def fingers_to_gesture(fingers):
+    if fingers <= 1:
+        return "Rock"
+    if fingers in (2, 3):
+        return "Scissors"
+    if fingers >= 4:
+        return "Paper"
+    return None
+
+
+def decide_winner(user, comp):
+    if user == comp:
         return "Draw"
-    if (player == "Rock" and computer == "Scissors") or \
-       (player == "Paper" and computer == "Rock") or \
-       (player == "Scissors" and computer == "Paper"):
-        return "Player"
-    return "Computer"
+    return "User" if BEATS[user] == comp else "Computer"
 
-# ---------------- MAIN LOOP ----------------
-while True:
-    success, frame = cap.read()
-    if not success:
-        break
 
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
+def main():
+    cap, width, height = open_camera(1280, 720)
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb)
+    mp_hands = mp.solutions.hands
+    mp_draw = mp.solutions.drawing_utils
+    fps = FPS()
 
-    player_move = None
+    gesture_buffer = deque(maxlen=STABLE_FRAMES)
+    user_score = computer_score = 0
+    last_play_time = 0.0
+    computer_choice = None
+    locked_user_move = None
+    result_text = "Show a gesture to begin"
 
-    if result.multi_hand_landmarks:
-        for handLms in result.multi_hand_landmarks:
-            mp_draw.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
-            gesture = get_gesture(handLms)
-            if gesture:
-                gesture_buffer.append(gesture)
-                if len(gesture_buffer) > STABLE_FRAMES:
-                    gesture_buffer.pop(0)
+    with mp_hands.Hands(
+        max_num_hands=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7,
+    ) as hands:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW, width, height)
 
-    if gesture_buffer.count(gesture_buffer[-1]) > STABLE_FRAMES // 2:
-        player_move = gesture_buffer[-1]
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("[rps] dropped frame, retrying...")
+                continue
 
-    # ---------- AUTO ROUND UPDATE ----------
-    if time.time() - last_round_time > ROUND_TIME and player_move:
-        computer_choice = random.choice(["Rock", "Paper", "Scissors"])
-        winner = decide_winner(player_move, computer_choice)
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
 
-        if winner == "Player":
-            player_score += 1
-            round_result = "YOU WIN!"
-        elif winner == "Computer":
-            computer_score += 1
-            round_result = "COMPUTER WINS!"
-        else:
-            round_result = "DRAW!"
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            result = hands.process(rgb)
 
-        last_round_time = time.time()
-        gesture_buffer.clear()
+            if result.multi_hand_landmarks:
+                hand_landmarks = result.multi_hand_landmarks[0]
+                label = "Right"
+                if result.multi_handedness:
+                    label = result.multi_handedness[0].classification[0].label
 
-    # ---------------- UI ----------------
-    cv2.rectangle(frame, (0, 0), (w, 100), (0, 0, 0), -1)
+                gesture = fingers_to_gesture(count_fingers(hand_landmarks, label))
+                if gesture:
+                    gesture_buffer.append(gesture)
 
-    cv2.putText(frame, f"Player: {player_score}", (30, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                mp_draw.draw_landmarks(
+                    frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                    mp_draw.DrawingSpec(color=(0, 220, 255), thickness=2, circle_radius=2),
+                    mp_draw.DrawingSpec(color=(120, 120, 120), thickness=1),
+                )
+            else:
+                # Let the buffer decay when the hand leaves, so a stale gesture
+                # cannot trigger a round.
+                if gesture_buffer:
+                    gesture_buffer.popleft()
 
-    cv2.putText(frame, f"Computer: {computer_score}", (350, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            # Steady gesture = same value in most of the recent frames.
+            steady_gesture = None
+            if len(gesture_buffer) >= STABLE_FRAMES:
+                move, count = Counter(gesture_buffer).most_common(1)[0]
+                if count > STABLE_FRAMES * 0.7:
+                    steady_gesture = move
 
-    if player_move:
-        cv2.putText(frame, f"You: {player_move}", (30, h - 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            now = time.time()
+            cooldown_left = max(0.0, ROUND_COOLDOWN - (now - last_play_time))
 
-    cv2.putText(frame, f"CPU: {computer_choice}", (350, h - 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+            if steady_gesture and cooldown_left == 0.0:
+                computer_choice = random.choice(list(BEATS))
+                locked_user_move = steady_gesture
+                winner = decide_winner(locked_user_move, computer_choice)
 
-    cv2.putText(frame, round_result, (w//2 - 150, h//2),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 255, 255), 3)
+                if winner == "User":
+                    user_score += 1
+                    result_text = "You Win!"
+                elif winner == "Computer":
+                    computer_score += 1
+                    result_text = "Computer Wins!"
+                else:
+                    result_text = "Draw!"
 
-    cv2.imshow("Rock Paper Scissors - CV", frame)
+                last_play_time = now
+                gesture_buffer.clear()
 
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
+            # -------- UI (sized from the real frame, not a constant) --------
+            cv2.rectangle(frame, (0, 0), (w, 120), (0, 0, 0), -1)
 
-cap.release()
-cv2.destroyAllWindows()
+            live = steady_gesture or (gesture_buffer[-1] if gesture_buffer else None)
+            cv2.putText(frame, f"You: {live or '--'}", (24, 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"CPU: {computer_choice or '--'}", (24, 92),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2, cv2.LINE_AA)
+
+            (tw, _), _ = cv2.getTextSize(result_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+            cv2.putText(frame, result_text, ((w - tw) // 2, 72),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3, cv2.LINE_AA)
+
+            cv2.putText(frame, f"You {user_score}", (w - 190, 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"CPU {computer_score}", (w - 190, 92),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+
+            if cooldown_left > 0:
+                cv2.putText(frame, f"next round in {cooldown_left:.1f}s",
+                            (w // 2 - 130, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (200, 200, 200), 2, cv2.LINE_AA)
+
+            fps.tick()
+            draw_hud(frame, [f"FPS: {fps:.0f}   |   r reset   ESC/q quit"],
+                     origin=(20, h - 20))
+
+            cv2.imshow(WINDOW, frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                break
+            if key == ord("r"):
+                user_score = computer_score = 0
+                computer_choice = locked_user_move = None
+                result_text = "Scores reset"
+
+            try:
+                if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"\n{exc}\n")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
